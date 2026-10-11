@@ -73,16 +73,45 @@ date_default_timezone_set(@date_default_timezone_get());
 
 
 /*** User authentication ***/
+// PDO rather than mysqli, so that the subscriber base may be MySQL or PostgreSQL.
+// AUTH_DB_DSN names the driver ("pgsql:host=...;dbname=..." or "mysql:host=...;dbname=...");
+// without it, the MySQL base of AUTH_DB_HOST and AUTH_DB_NAME is used, as before.
+function auth_db_dsn()
+{
+	if (defined("AUTH_DB_DSN") && strlen(AUTH_DB_DSN) > 0) {
+		return AUTH_DB_DSN;
+	}
+	return "mysql:host=" . AUTH_DB_HOST . ";dbname=" . AUTH_DB_NAME . ";charset=utf8mb4";
+}
+
 function auth_get_db_conn()
 {
-	$conn = (USE_PERSISTENT_CONNECTIONS)
-		? mysqli_connect('p:' . AUTH_DB_HOST, AUTH_DB_USER, AUTH_DB_PASSWORD, AUTH_DB_NAME)
-		: mysqli_connect(AUTH_DB_HOST, AUTH_DB_USER, AUTH_DB_PASSWORD, AUTH_DB_NAME);
-
-	if (!$conn) {
-		fhft_log(LogLevel::ERROR, "Unable to connect to MySQL base " . AUTH_DB_NAME . ".\nDebugging errno: " . mysqli_connect_errno() . "\nDebugging error: " . mysqli_connect_error() . "\n");
+	try {
+		return new PDO(auth_db_dsn(), AUTH_DB_USER, AUTH_DB_PASSWORD, [
+			PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+			PDO::ATTR_PERSISTENT => USE_PERSISTENT_CONNECTIONS,
+		]);
+	} catch (PDOException $e) {
+		fhft_log(LogLevel::ERROR, "Unable to connect to the subscriber base: " . $e->getMessage() . "\n");
+		return null;
 	}
-	return $conn;
+}
+
+// The rows AUTH_QUERY returns for ($username, $realm); null when the base cannot be read.
+function auth_query_rows($username, $realm)
+{
+	$db = auth_get_db_conn();
+	if ($db === null) {
+		return null;
+	}
+	try {
+		$stmt = $db->prepare(AUTH_QUERY);
+		$stmt->execute([$username, $realm]);
+		return $stmt->fetchAll(PDO::FETCH_ASSOC);
+	} catch (PDOException $e) {
+		fhft_log(LogLevel::ERROR, "Unable to execute " . AUTH_QUERY . ": " . $e->getMessage() . "\n");
+		return null;
+	}
 }
 
 // Nonce are one-time usage, in order to avoid storing them in a table
@@ -106,39 +135,29 @@ function request_authentication($realm = "sip.example.org", $username = null)
 
 	if ($username != null) {
 		// Get the password/hash from database to include only available password hash in the authenticate header
-		$db = auth_get_db_conn();
-		$stmt = $db->prepare(AUTH_QUERY);
-		if (!$stmt) {
-			fhft_log(LogLevel::ERROR, "Unable to execute " . AUTH_QUERY . ".\nDebugging errno: " . mysqli_connect_errno() . "\nDebugging error: " . mysqli_connect_error() . "\n");
+		$rows = auth_query_rows($username, $realm);
+		if ($rows === null) {
 			$has_md5 = true;
 			$has_sha256 = true;
 		} else {
-			$stmt->bind_param('ss', $username, $realm);
-			$stmt->execute();
-
-			if ($query_result = $stmt->get_result()) {
-				while ($row = $query_result->fetch_assoc()) {
-					$algorithm = $row['algorithm'];
-					if ($algorithm == 'CLRTXT') {
-						fhft_log(LogLevel::DEBUG, "User  " . $username . " has clear text password in db \n");
-						$has_md5 = true;
-						$has_sha256 = true;
-						break; // with clear text password, we can reconstruct MD5 or SHA256 hash, don't parse anything else from base
-					} elseif ($algorithm == 'MD5') {
-						fhft_log(LogLevel::DEBUG, "User  " . $username . " has md5 password in db \n");
-						$has_md5 = true;
-					} elseif ($algorithm == 'SHA-256') {
-						fhft_log(LogLevel::DEBUG, "User  " . $username . " has sha256 password in db \n");
-						$has_sha256 = true;
-					} else {
-						fhft_log(LogLevel::WARNING, "User  " . $username . " uses unrecognised hash algorithm " . $algorithm . " to store password in db \n");
-					}
+			foreach ($rows as $row) {
+				$algorithm = $row['algorithm'];
+				if ($algorithm == 'CLRTXT') {
+					fhft_log(LogLevel::DEBUG, "User  " . $username . " has clear text password in db \n");
+					$has_md5 = true;
+					$has_sha256 = true;
+					break; // with clear text password, we can reconstruct MD5 or SHA256 hash, don't parse anything else from base
+				} elseif ($algorithm == 'MD5') {
+					fhft_log(LogLevel::DEBUG, "User  " . $username . " has md5 password in db \n");
+					$has_md5 = true;
+				} elseif ($algorithm == 'SHA-256') {
+					fhft_log(LogLevel::DEBUG, "User  " . $username . " has sha256 password in db \n");
+					$has_sha256 = true;
+				} else {
+					fhft_log(LogLevel::WARNING, "User  " . $username . " uses unrecognised hash algorithm " . $algorithm . " to store password in db \n");
 				}
 			}
-
-			$stmt->close();
 		}
-		$db->close();
 	} else { // we don't have the username authorize both MD5 and SHA256
 		$has_md5 = true;
 		$has_sha256 = true;
@@ -192,14 +211,10 @@ function authenticate($auth_digest, $realm = "sip.example.org")
 	}
 
 	// Get the password/hash from database
-	$db = auth_get_db_conn();
-	$stmt = $db->prepare(AUTH_QUERY);
-	if (!$stmt) {
-		fhft_log(LogLevel::ERROR, "Unable to execute " . AUTH_QUERY . ".\nDebugging errno: " . mysqli_connect_errno() . "\nDebugging error: " . mysqli_connect_error() . "\n");
+	$rows = auth_query_rows($username, $realm);
+	if ($rows === null) {
 		return;
 	}
-	$stmt->bind_param('ss', $username, $realm);
-	$stmt->execute();
 
 	// Default requested to MD5 if not specified in header
 	$requested_algorithm = (array_key_exists('algorithm', $data))
@@ -207,25 +222,20 @@ function authenticate($auth_digest, $realm = "sip.example.org")
 		: 'MD5';
 
 	$password = null;
-	if ($query_result = $stmt->get_result()) {
-		while ($row = $query_result->fetch_assoc()) {
-			$password = $row['password'];
-			$algorithm = $row['algorithm'];
-			if ($algorithm == 'CLRTXT') {
-				fhft_log(LogLevel::DEBUG, "User  " . $username . " using clear text password from db \n");
-				break; // with clear text password, we can reconstruct MD5 or SHA256 hash, don't parse anything else from base
-			} elseif ($algorithm == $requested_algorithm) {
-				fhft_log(LogLevel::DEBUG, "User  " . $username . " using " . $row['algorithm'] . " password from db \n");
-				break; // we found the requested hash in base, don't parse anything else
-			} else { // algo used to store the password in base won't allow to reconstruct the one given in the header, keep parsing query result
-				$password = null;
-				$algorithm = null;
-			}
+	foreach ($rows as $row) {
+		$password = $row['password'];
+		$algorithm = $row['algorithm'];
+		if ($algorithm == 'CLRTXT') {
+			fhft_log(LogLevel::DEBUG, "User  " . $username . " using clear text password from db \n");
+			break; // with clear text password, we can reconstruct MD5 or SHA256 hash, don't parse anything else from base
+		} elseif ($algorithm == $requested_algorithm) {
+			fhft_log(LogLevel::DEBUG, "User  " . $username . " using " . $row['algorithm'] . " password from db \n");
+			break; // we found the requested hash in base, don't parse anything else
+		} else { // algo used to store the password in base won't allow to reconstruct the one given in the header, keep parsing query result
+			$password = null;
+			$algorithm = null;
 		}
 	}
-
-	$stmt->close();
-	$db->close();
 
 	if (is_null($password)) {
 		fhft_log(LogLevel::ERROR, "Unable to find password for User: " . $username . " in format " . $requested_algorithm);
